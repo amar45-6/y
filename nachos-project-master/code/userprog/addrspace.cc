@@ -248,16 +248,54 @@ void AddrSpace::InitRegisters() {
 // AddrSpace::SaveState
 //----------------------------------------------------------------------
 
-void AddrSpace::SaveState() {}
+void AddrSpace::SaveState() {
+#ifdef USE_TLB
+    SaveTLBState();
+#endif
+}
+
+void AddrSpace::RestoreState() {
+#ifdef USE_TLB
+    kernel->machine->pageTable     = NULL;
+    kernel->machine->pageTableSize = 0;
+    ClearTLB();
+#else
+    kernel->machine->pageTable     = pageTable;
+    kernel->machine->pageTableSize = numPages;
+#endif
+}
+
+TranslationEntry *AddrSpace::FindPTE(int vpn) {
+    if (vpn < 0 || (unsigned int)vpn >= numPages)
+        return NULL;
+    return &pageTable[vpn];
+}
+
+void AddrSpace::SaveTLBState() {
+#ifdef USE_TLB
+    Machine *machine = kernel->machine;
+    for (int i = 0; i < TLBSize; i++) {
+        TranslationEntry &tlbEntry = machine->tlb[i];
+        if (!tlbEntry.valid) continue;
+        TranslationEntry *pte = FindPTE(tlbEntry.virtualPage);
+        if (pte != NULL) {
+            pte->use   = pte->use   || tlbEntry.use;
+            pte->dirty = pte->dirty || tlbEntry.dirty;
+        }
+    }
+#endif
+}
+
+void AddrSpace::ClearTLB() {
+#ifdef USE_TLB
+    for (int i = 0; i < TLBSize; i++)
+        kernel->machine->tlb[i].valid = FALSE;
+#endif
+}
 
 //----------------------------------------------------------------------
 // AddrSpace::RestoreState
-//----------------------------------------------------------------------
-
-void AddrSpace::RestoreState() {
-    kernel->machine->pageTable = pageTable;
-    kernel->machine->pageTableSize = numPages;
-}
+//------------------------------------------------------------
 
 //----------------------------------------------------------------------
 // AddrSpace::Translate

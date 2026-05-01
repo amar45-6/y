@@ -10,59 +10,60 @@
 // All rights reserved.  See copyright.h for copyright notice and limitation
 // of liability and disclaimer of warranty provisions.
 
+// addrspace.h
 #ifndef ADDRSPACE_H
 #define ADDRSPACE_H
 
 #include "copyright.h"
 #include "filesys.h"
 
-#define UserStackSize 1024  // increase this as necessary!
+#define UserStackSize 1024
 
 class AddrSpace {
    public:
-    AddrSpace();                // Create an address space.
-    AddrSpace(char *fileName);  // Load a program into addr space from
-                                // a file
-    ~AddrSpace();               // De-allocate an address space
+    AddrSpace();
+    AddrSpace(char *fileName);
+    ~AddrSpace();
+
     bool isLoaded() { return pageTable != NULL; }
-    void Execute();  // Run a program
-                     // assumes the program has already
-                     // been loaded
 
-    void SaveState();     // Save/restore address space-specific
-    void RestoreState();  // info on a context switch
+    void Execute();
 
-    // Translate virtual address _vaddr_
-    // to physical address _paddr_. _mode_
-    // is 0 for Read, 1 for Write.
+    void SaveState();
+    void RestoreState();
+
     ExceptionType Translate(unsigned int vaddr, unsigned int *paddr, int mode);
-    // void InitRegisters();
+
+    // TLB helpers
+    int NumPages() const { return numPages; }
+    TranslationEntry *GetPageTable() { return pageTable; }
+    TranslationEntry *FindPTE(int vpn);
+    void SaveTLBState();
+    void ClearTLB();
+
    private:
-    TranslationEntry *pageTable;  // Assume linear page table translation
-                                  // for now!
-    unsigned int numPages;        // Number of pages in the virtual
-                                  // address space
+    TranslationEntry *pageTable;
+    unsigned int numPages;
 
     // --- DEMAND PAGING: keep executable open for lazy page loading ---
-    OpenFile *executableFile;   // file handle kept open (not deleted in ctor)
-    int codeOffset;             // noffH.code.inFileAddr
-    int codeSize;               // noffH.code.size
-    int codeVirtualAddr;        // noffH.code.virtualAddr
-    int dataOffset;             // noffH.initData.inFileAddr
-    int dataSize;               // noffH.initData.size
-    int dataVirtualAddr;        // noffH.initData.virtual
-    int uninitOffset;       // noffH.uninitData.inFileAddr   ADD THIS
-    int uninitSize;         // noffH.uninitData.size         ADD THIS
-    int uninitVirtualAddr;  // noffH.uninitData.virtualAddr  ADD THIS
-    #ifdef RDATA
+    OpenFile *executableFile;
+    int codeOffset;
+    int codeSize;
+    int codeVirtualAddr;
+    int dataOffset;
+    int dataSize;
+    int dataVirtualAddr;
+    int uninitOffset;
+    int uninitSize;
+    int uninitVirtualAddr;
+#ifdef RDATA
     int rdataOffset;
     int rdataSize;
     int rdataVirtualAddr;
-    #endif
+#endif
     // -----------------------------------------------------------------
 
-    void InitRegisters();  // Initialize user-level CPU registers,
-                           // before jumping to user code
+    void InitRegisters();
 };
 
 #endif  // ADDRSPACE_H

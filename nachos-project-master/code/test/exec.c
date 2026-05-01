@@ -3,15 +3,14 @@
  */
 
 #include "syscall.h"
-#define stdin 0
-#define stdout 1
 
 int main() {
     int pid;
-    pid = Exec("num_io");
+    pid = Exec("halt");
     if (pid < 0) {
-        Write("Exec failed: ", 14, stdout);
-        PrintNum(pid);
-    } else
+        PrintString("Exec failed\n");
+    } else {
         Join(pid);
+    }
+    Exit(0);
 }

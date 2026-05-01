@@ -57,6 +57,84 @@
  * blank to convert all characters of user string
  * @return char*
  */
+
+// ---- TLB statistics ----
+static int gTLBMissCount        = 0;
+static int gTLBReplaceCount     = 0;
+static int gTLBInvalidFillCount = 0;
+static int gTLBSaveBackCount    = 0;
+
+static int nextTLBSlot = 0;
+
+static int SelectTLBVictim() {
+    for (int i = 0; i < TLBSize; i++) {
+        if (!kernel->machine->tlb[i].valid) {
+            gTLBInvalidFillCount++;
+            return i;
+        }
+    }
+    int victim = nextTLBSlot;
+    nextTLBSlot = (nextTLBSlot + 1) % TLBSize;
+    gTLBReplaceCount++;
+    return victim;
+}
+
+static void SaveBackTLBEntry(AddrSpace *space, TranslationEntry &entry) {
+    if (!entry.valid || space == NULL) return;
+    TranslationEntry *pte = space->FindPTE(entry.virtualPage);
+    if (pte != NULL) {
+        pte->use   = pte->use   || entry.use;
+        pte->dirty = pte->dirty || entry.dirty;
+        if (entry.dirty) gTLBSaveBackCount++;
+    }
+}
+
+/* static bool HandleTLBMiss() {
+#ifndef USE_TLB
+    return false;
+#else
+    AddrSpace *space = kernel->currentThread->space;
+    if (space == NULL) return false;
+
+    int badVAddr = kernel->machine->ReadRegister(BadVAddrReg);
+    int vpn = (unsigned int)badVAddr / PageSize;
+
+    TranslationEntry *pte = space->FindPTE(vpn);
+    if (pte == NULL || !pte->valid) return false;
+
+    gTLBMissCount++;
+    int victim = SelectTLBVictim();
+    SaveBackTLBEntry(space, kernel->machine->tlb[victim]);
+*/
+
+static bool HandleTLBMiss() {
+#ifndef USE_TLB
+    return false;
+#else
+    AddrSpace *space = kernel->currentThread->space;
+    if (space == NULL) return false;
+
+    int badVAddr = kernel->machine->ReadRegister(BadVAddrReg);
+    int vpn = (unsigned int)badVAddr / PageSize;
+
+    // First: if page not yet loaded (demand paging), load it now
+    unsigned int paddr;
+    space->Translate((unsigned int)badVAddr, &paddr, 0);
+
+    // Now the page should be valid — find the PTE
+    TranslationEntry *pte = space->FindPTE(vpn);
+    if (pte == NULL || !pte->valid) return false;  // truly illegal address
+
+    gTLBMissCount++;
+    int victim = SelectTLBVictim();
+    SaveBackTLBEntry(space, kernel->machine->tlb[victim]);
+
+    kernel->machine->tlb[victim] = *pte;
+    kernel->machine->tlb[victim].valid = TRUE;
+    return true;
+#endif
+}
+
 char* stringUser2System(int addr, int convert_length = -1) {
     int length = 0;
     bool stop = false;
@@ -138,6 +216,14 @@ void handle_not_implemented_SC(int type) {
 
 void handle_SC_Halt() {
     DEBUG(dbgSys, "Shutdown, initiated by user program.\n");
+#ifdef USE_TLB
+    printf("\n---- TLB Statistics ----\n");
+    printf("TLB misses          : %d\n", gTLBMissCount);
+    printf("Invalid slot fills  : %d\n", gTLBInvalidFillCount);
+    printf("Valid slot evictions: %d\n", gTLBReplaceCount);
+    printf("Dirty savebacks     : %d\n", gTLBSaveBackCount);
+    printf("------------------------\n");
+#endif
     SysHalt();
     ASSERTNOTREACHED();
 }
@@ -467,21 +553,12 @@ void ExceptionHandler(ExceptionType which) {
             SysHalt();
             ASSERTNOTREACHED();
 
-        case PageFaultException: {
-            // Get the faulting virtual address
-            unsigned int vaddr = kernel->machine->ReadRegister(BadVAddrReg);
-            
-            unsigned int paddr;
-            // Re-invoke Translate — our updated version will load the page
-            ExceptionType result = kernel->currentThread->space->Translate(vaddr, &paddr, 0);
-            if (result != NoException) {
-                cerr << "Page fault could not be resolved at vaddr " << vaddr << "\n";
-                SysHalt();
-                ASSERTNOTREACHED();
-            }
-            // Do NOT advance PC — re-execute the faulting instruction
-            return;  // must return, not break — break falls through to ASSERTNOTREACHED
-        }
+        case PageFaultException:
+    		if (HandleTLBMiss()) {
+        		return;
+    		}
+    		SysHalt();
+    		ASSERTNOTREACHED();
                      
         case SyscallException:
             switch (type) {
