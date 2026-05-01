@@ -19,20 +19,20 @@ PCB::~PCB() {
         // delete thread;
     }
 
-    delete[] filename;
+    delete[] filename; 
 }
 
 void StartProcess_2(void* pid) {
     int id;
     id = *((int*)pid);
-    // Lay fileName cua process id nay
     char* fileName = kernel->pTab->GetFileName(id);
 
     AddrSpace* space;
     space = new AddrSpace(fileName);
 
-    if (space == NULL) {
-        printf("\nPCB::Exec: Can't create AddSpace.");
+    if (space == NULL || !space->isLoaded()) {
+        printf("\nPCB::Exec: Can't create AddSpace for %s\n", fileName);
+        delete space;
         return;
     }
 

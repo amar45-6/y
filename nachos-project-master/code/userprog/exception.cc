@@ -64,7 +64,11 @@ char* stringUser2System(int addr, int convert_length = -1) {
 
     do {
         int oneChar;
-        kernel->machine->ReadMem(addr + length, 1, &oneChar);
+        // Retry until ReadMem succeeds: with demand paging the first call may
+        // trigger a page fault (returns FALSE after loading the page); the
+        // retry reads the correct byte.
+        while (!kernel->machine->ReadMem(addr + length, 1, &oneChar))
+            ;
         length++;
         // if convert_length == -1, we use '\0' to terminate the process
         // otherwise, we use convert_length to terminate the process
@@ -75,8 +79,8 @@ char* stringUser2System(int addr, int convert_length = -1) {
     str = new char[length];
     for (int i = 0; i < length; i++) {
         int oneChar;
-        kernel->machine->ReadMem(addr + i, 1,
-                                 &oneChar);  // copy characters to kernel space
+        while (!kernel->machine->ReadMem(addr + i, 1, &oneChar))
+            ;  // retry on page fault
         str[i] = (unsigned char)oneChar;
     }
     return str;
@@ -94,10 +98,11 @@ char* stringUser2System(int addr, int convert_length = -1) {
 void StringSys2User(char* str, int addr, int convert_length = -1) {
     int length = (convert_length == -1 ? strlen(str) : convert_length);
     for (int i = 0; i < length; i++) {
-        kernel->machine->WriteMem(addr + i, 1,
-                                  str[i]);  // copy characters to user space
+        while (!kernel->machine->WriteMem(addr + i, 1, str[i]))
+            ;  // retry on page fault (demand paging)
     }
-    kernel->machine->WriteMem(addr + length, 1, '\0');
+    while (!kernel->machine->WriteMem(addr + length, 1, '\0'))
+        ;
 }
 
 /**
@@ -451,8 +456,7 @@ void ExceptionHandler(ExceptionType which) {
         case NoException:  // return control to kernel
             kernel->interrupt->setStatus(SystemMode);
             DEBUG(dbgSys, "Switch to system mode\n");
-            break;
-        case PageFaultException:
+            return;
         case ReadOnlyException:
         case BusErrorException:
         case AddressErrorException:
@@ -463,6 +467,22 @@ void ExceptionHandler(ExceptionType which) {
             SysHalt();
             ASSERTNOTREACHED();
 
+        case PageFaultException: {
+            // Get the faulting virtual address
+            unsigned int vaddr = kernel->machine->ReadRegister(BadVAddrReg);
+            
+            unsigned int paddr;
+            // Re-invoke Translate — our updated version will load the page
+            ExceptionType result = kernel->currentThread->space->Translate(vaddr, &paddr, 0);
+            if (result != NoException) {
+                cerr << "Page fault could not be resolved at vaddr " << vaddr << "\n";
+                SysHalt();
+                ASSERTNOTREACHED();
+            }
+            // Do NOT advance PC — re-execute the faulting instruction
+            return;  // must return, not break — break falls through to ASSERTNOTREACHED
+        }
+                     
         case SyscallException:
             switch (type) {
                 case SC_Halt:
@@ -538,7 +558,7 @@ void ExceptionHandler(ExceptionType which) {
                     cerr << "Unexpected system call " << type << "\n";
                     break;
             }
-            break;
+            return;
         default:
             cerr << "Unexpected user mode exception" << (int)which << "\n";
             break;

@@ -24,7 +24,7 @@ class AddrSpace {
     AddrSpace(char *fileName);  // Load a program into addr space from
                                 // a file
     ~AddrSpace();               // De-allocate an address space
-
+    bool isLoaded() { return pageTable != NULL; }
     void Execute();  // Run a program
                      // assumes the program has already
                      // been loaded
@@ -42,6 +42,24 @@ class AddrSpace {
                                   // for now!
     unsigned int numPages;        // Number of pages in the virtual
                                   // address space
+
+    // --- DEMAND PAGING: keep executable open for lazy page loading ---
+    OpenFile *executableFile;   // file handle kept open (not deleted in ctor)
+    int codeOffset;             // noffH.code.inFileAddr
+    int codeSize;               // noffH.code.size
+    int codeVirtualAddr;        // noffH.code.virtualAddr
+    int dataOffset;             // noffH.initData.inFileAddr
+    int dataSize;               // noffH.initData.size
+    int dataVirtualAddr;        // noffH.initData.virtual
+    int uninitOffset;       // noffH.uninitData.inFileAddr   ADD THIS
+    int uninitSize;         // noffH.uninitData.size         ADD THIS
+    int uninitVirtualAddr;  // noffH.uninitData.virtualAddr  ADD THIS
+    #ifdef RDATA
+    int rdataOffset;
+    int rdataSize;
+    int rdataVirtualAddr;
+    #endif
+    // -----------------------------------------------------------------
 
     void InitRegisters();  // Initialize user-level CPU registers,
                            // before jumping to user code
