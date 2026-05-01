@@ -871,3 +871,473 @@ The output is correct because:
 - The correct squares (`9, 49, 144, 25, 400`) confirm `pipe_reader`'s integer parsing and arithmetic are working correctly.
 - `Pipe done.` appearing after all squared values confirms sequential execution order — `pipe_writer` finished before `pipe_reader` ran, and `pipe_reader` finished before `pipe_test` continued.
 - `Machine halting!` with no error confirms all processes exited cleanly via `Exit(0)` and only the final `Halt()` shut down the machine.
+
+  # Task 5) Demand Paging Implementation in NachOS
+
+## Overview
+
+Implemented demand paging in NachOS — pages are marked **invalid** at load time and loaded lazily from the executable file **only when first accessed**, triggered by a `PageFaultException`. This replaces the old eager-loading approach where all pages were read into memory upfront.
+
+---
+
+## Files Modified
+
+| File | Change |
+|------|--------|
+| `code/userprog/addrspace.h` | Added segment fields + `isLoaded()` check |
+| `code/userprog/addrspace.cc` | Rewrote constructor + destructor + added `Translate()` with lazy loading |
+| `code/userprog/exception.cc` | Added `PageFaultException` handler + retry loops in `ReadMem`/`WriteMem` |
+| `code/threads/pcb.cc` | Fixed null-space check using `isLoaded()` |
+
+---
+
+## Implementation
+
+### 1. `code/userprog/addrspace.h`
+
+Added `isLoaded()` method and new private fields to store segment info for lazy loading:
+
+```cpp
+class AddrSpace {
+   public:
+    AddrSpace();
+    AddrSpace(char *fileName);
+    ~AddrSpace();
+    bool isLoaded() { return pageTable != NULL; }  // ADD THIS
+    void Execute();
+    void SaveState();
+    void RestoreState();
+    ExceptionType Translate(unsigned int vaddr, unsigned int *paddr, int mode);
+
+   private:
+    TranslationEntry *pageTable;
+    unsigned int numPages;
+
+    // --- DEMAND PAGING: keep executable open for lazy page loading ---
+    OpenFile *executableFile;   // file handle kept open (not deleted in ctor)
+    int codeOffset;             // noffH.code.inFileAddr
+    int codeSize;               // noffH.code.size
+    int codeVirtualAddr;        // noffH.code.virtualAddr
+    int dataOffset;             // noffH.initData.inFileAddr
+    int dataSize;               // noffH.initData.size
+    int dataVirtualAddr;        // noffH.initData.virtualAddr
+    int uninitOffset;           // noffH.uninitData.inFileAddr
+    int uninitSize;             // noffH.uninitData.size
+    int uninitVirtualAddr;      // noffH.uninitData.virtualAddr
+    #ifdef RDATA
+    int rdataOffset;            // noffH.readonlyData.inFileAddr
+    int rdataSize;              // noffH.readonlyData.size
+    int rdataVirtualAddr;       // noffH.readonlyData.virtualAddr
+    #endif
+    // -----------------------------------------------------------------
+
+    void InitRegisters();
+};
+```
+
+---
+
+### 2. `code/userprog/addrspace.cc`
+
+#### Default Constructor — zero all fields
+
+```cpp
+AddrSpace::AddrSpace() {
+    #ifdef RDATA
+    rdataOffset      = 0;
+    rdataSize        = 0;
+    rdataVirtualAddr = 0;
+    #endif
+    uninitOffset      = 0;
+    uninitSize        = 0;
+    uninitVirtualAddr = 0;
+    pageTable       = NULL;
+    numPages        = 0;
+    executableFile  = NULL;
+    codeOffset      = 0;
+    codeSize        = 0;
+    codeVirtualAddr = 0;
+    dataOffset      = 0;
+    dataSize        = 0;
+    dataVirtualAddr = 0;
+}
+```
+
+#### Destructor — only free valid frames + close executable
+
+```cpp
+AddrSpace::~AddrSpace() {
+    for (int i = 0; i < (int)numPages; i++) {
+        // Only free frames that were actually loaded
+        if (pageTable[i].valid) {
+            kernel->gPhysPageBitMap->Clear(pageTable[i].physicalPage);
+        }
+    }
+    delete[] pageTable;
+
+    // DEMAND PAGING: close the executable file we kept open
+    if (executableFile != NULL) {
+        delete executableFile;
+        executableFile = NULL;
+    }
+}
+```
+
+#### Constructor `AddrSpace(char *fileName)` — mark all pages invalid, save segment info
+
+```cpp
+AddrSpace::AddrSpace(char *fileName) {
+    OpenFile *executable = kernel->fileSystem->Open(fileName);
+    NoffHeader noffH;
+    unsigned int i, size;
+
+    #ifdef RDATA
+    rdataOffset      = 0;
+    rdataSize        = 0;
+    rdataVirtualAddr = 0;
+    #endif
+    uninitOffset      = 0;
+    uninitSize        = 0;
+    uninitVirtualAddr = 0;
+    pageTable       = NULL;
+    numPages        = 0;
+    executableFile  = NULL;
+    codeOffset      = 0;
+    codeSize        = 0;
+    codeVirtualAddr = 0;
+    dataOffset      = 0;
+    dataSize        = 0;
+    dataVirtualAddr = 0;
+
+    if (executable == NULL) {
+        DEBUG(dbgFile, "\n Error opening file.");
+        return;
+    }
+
+    // Read the NOFF header
+    executable->ReadAt((char *)&noffH, sizeof(noffH), 0);
+    if ((noffH.noffMagic != NOFFMAGIC) &&
+        (WordToHost(noffH.noffMagic) == NOFFMAGIC))
+        SwapHeader(&noffH);
+    ASSERT(noffH.noffMagic == NOFFMAGIC);
+
+    kernel->addrLock->P();
+
+    // How big is address space?
+    size = noffH.code.size + noffH.initData.size + noffH.uninitData.size
+        #ifdef RDATA
+            + noffH.readonlyData.size
+        #endif
+            + UserStackSize;
+    numPages = divRoundUp(size, PageSize);
+    size = numPages * PageSize;
+
+    ASSERT(numPages <= NumPhysPages);
+
+    // DEMAND PAGING: only need at least one free frame for the first fault
+    if (kernel->gPhysPageBitMap->NumClear() == 0) {
+        DEBUG(dbgAddr, "No free physical frames at all");
+        numPages = 0;
+        delete executable;
+        kernel->addrLock->V();
+        return;
+    }
+
+    DEBUG(dbgAddr, "Initializing address space (demand paging): "
+                       << numPages << " pages, " << size << " bytes");
+
+    // Set up page table — all pages start INVALID (not yet in memory)
+    pageTable = new TranslationEntry[numPages];
+    for (i = 0; i < numPages; i++) {
+        pageTable[i].virtualPage  = i;
+        pageTable[i].physicalPage = -1;     // no frame assigned yet
+        pageTable[i].valid        = FALSE;  // triggers PageFaultException on first access
+        pageTable[i].use          = FALSE;
+        pageTable[i].dirty        = FALSE;
+        pageTable[i].readOnly     = FALSE;
+        DEBUG(dbgAddr, "Page " << i << " marked invalid (demand paging)");
+    }
+
+    // DEMAND PAGING: Save segment info so the fault handler can read the
+    // correct bytes from disk when each page is first accessed.
+    #ifdef RDATA
+    rdataOffset      = noffH.readonlyData.inFileAddr;
+    rdataSize        = noffH.readonlyData.size;
+    rdataVirtualAddr = noffH.readonlyData.virtualAddr;
+    #endif
+    executableFile  = executable;           // Keep file open — do NOT delete here
+    codeOffset      = noffH.code.inFileAddr;
+    codeSize        = noffH.code.size;
+    codeVirtualAddr = noffH.code.virtualAddr;
+    dataOffset      = noffH.initData.inFileAddr;
+    dataSize        = noffH.initData.size;
+    dataVirtualAddr = noffH.initData.virtualAddr;
+    uninitOffset      = noffH.uninitData.inFileAddr;
+    uninitSize        = noffH.uninitData.size;
+    uninitVirtualAddr = noffH.uninitData.virtualAddr;
+
+    kernel->addrLock->V();
+    // NOTE: executable is intentionally NOT deleted here
+    return;
+}
+```
+
+#### `Translate()` — lazy page loading on fault
+
+```cpp
+ExceptionType AddrSpace::Translate(unsigned int vaddr, unsigned int *paddr,
+                                   int isReadWrite) {
+    TranslationEntry *pte;
+    int pfn;
+    unsigned int vpn    = vaddr / PageSize;
+    unsigned int offset = vaddr % PageSize;
+
+    if (vpn >= numPages) {
+        return AddressErrorException;
+    }
+
+    pte = &pageTable[vpn];
+
+    // ---- DEMAND PAGING: page not yet loaded ----
+    if (!pte->valid) {
+        // Find a free physical frame
+        int phyPage = kernel->gPhysPageBitMap->FindAndSet();
+        if (phyPage == -1) {
+            DEBUG(dbgAddr, "No free physical frames for vpn=" << vpn);
+            return BusErrorException;
+        }
+
+        // Zero out the frame first
+        bzero(&(kernel->machine->mainMemory[phyPage * PageSize]), PageSize);
+
+        int pageStartVA = vpn * PageSize;
+
+        #ifdef RDATA
+        // Load readonlyData segment (string literals live here)
+        if (rdataSize > 0 &&
+            pageStartVA < (unsigned int)(rdataVirtualAddr + rdataSize) &&
+            pageStartVA + PageSize > (unsigned int)rdataVirtualAddr) {
+            int memOff = (pageStartVA >= (unsigned int)rdataVirtualAddr) ? 0 : rdataVirtualAddr - pageStartVA;
+            int segOff = (pageStartVA >= (unsigned int)rdataVirtualAddr) ? pageStartVA - rdataVirtualAddr : 0;
+            int bytes  = rdataSize - segOff;
+            if (bytes > PageSize - memOff) bytes = PageSize - memOff;
+            if (bytes > 0)
+                executableFile->ReadAt(
+                    &(kernel->machine->mainMemory[phyPage * PageSize + memOff]),
+                    bytes, rdataOffset + segOff);
+        }
+        #endif
+
+        // Load code segment portion of this page
+        if (codeSize > 0 &&
+            pageStartVA < (unsigned int)(codeVirtualAddr + codeSize) &&
+            pageStartVA + PageSize > (unsigned int)codeVirtualAddr) {
+            int memOff  = (pageStartVA >= (unsigned int)codeVirtualAddr) ? 0 : codeVirtualAddr - pageStartVA;
+            int segOff  = (pageStartVA >= (unsigned int)codeVirtualAddr) ? pageStartVA - codeVirtualAddr : 0;
+            int bytes   = codeSize - segOff;
+            if (bytes > PageSize - memOff) bytes = PageSize - memOff;
+            if (bytes > 0)
+                executableFile->ReadAt(
+                    &(kernel->machine->mainMemory[phyPage * PageSize + memOff]),
+                    bytes, codeOffset + segOff);
+        }
+
+        // Load initData segment portion of this page
+        if (dataSize > 0 &&
+            pageStartVA < (unsigned int)(dataVirtualAddr + dataSize) &&
+            pageStartVA + PageSize > (unsigned int)dataVirtualAddr) {
+            int memOff  = (pageStartVA >= (unsigned int)dataVirtualAddr) ? 0 : dataVirtualAddr - pageStartVA;
+            int segOff  = (pageStartVA >= (unsigned int)dataVirtualAddr) ? pageStartVA - dataVirtualAddr : 0;
+            int bytes   = dataSize - segOff;
+            if (bytes > PageSize - memOff) bytes = PageSize - memOff;
+            if (bytes > 0)
+                executableFile->ReadAt(
+                    &(kernel->machine->mainMemory[phyPage * PageSize + memOff]),
+                    bytes, dataOffset + segOff);
+        }
+
+        // Load uninitData segment portion of this page
+        if (uninitSize > 0 &&
+            pageStartVA < (unsigned int)(uninitVirtualAddr + uninitSize) &&
+            pageStartVA + PageSize > (unsigned int)uninitVirtualAddr) {
+            int memOff  = (pageStartVA >= (unsigned int)uninitVirtualAddr) ? 0 : uninitVirtualAddr - pageStartVA;
+            int segOff  = (pageStartVA >= (unsigned int)uninitVirtualAddr) ? pageStartVA - uninitVirtualAddr : 0;
+            int bytes   = uninitSize - segOff;
+            if (bytes > PageSize - memOff) bytes = PageSize - memOff;
+            if (bytes > 0)
+                executableFile->ReadAt(
+                    &(kernel->machine->mainMemory[phyPage * PageSize + memOff]),
+                    bytes, uninitOffset + segOff);
+        }
+
+        printf("[Page %d loaded into frame %d]\n", vpn, phyPage);
+
+        // Update the page table entry
+        pte->physicalPage = phyPage;
+        pte->valid        = TRUE;
+        pte->use          = FALSE;
+        pte->dirty        = FALSE;
+    }
+    // ---- end demand paging ----
+
+    if (isReadWrite && pte->readOnly) {
+        return ReadOnlyException;
+    }
+
+    pfn = pte->physicalPage;
+
+    if (pfn >= NumPhysPages) {
+        DEBUG(dbgAddr, "Illegal physical page " << pfn);
+        return BusErrorException;
+    }
+
+    pte->use = TRUE;
+    if (isReadWrite) pte->dirty = TRUE;
+
+    *paddr = pfn * PageSize + offset;
+
+    ASSERT((*paddr < MemorySize));
+
+    return NoException;
+}
+```
+
+---
+
+### 3. `code/userprog/exception.cc`
+
+#### `stringUser2System()` — retry `ReadMem` on page fault
+
+```cpp
+char* stringUser2System(int addr, int convert_length = -1) {
+    int length = 0;
+    bool stop = false;
+    char* str;
+
+    do {
+        int oneChar;
+        // Retry until ReadMem succeeds: with demand paging the first call may
+        // trigger a page fault (returns FALSE after loading the page);
+        // the retry reads the correct byte.
+        while (!kernel->machine->ReadMem(addr + length, 1, &oneChar))
+            ;
+        length++;
+        stop = ((oneChar == '\0' && convert_length == -1) ||
+                length == convert_length);
+    } while (!stop);
+
+    str = new char[length];
+    for (int i = 0; i < length; i++) {
+        int oneChar;
+        while (!kernel->machine->ReadMem(addr + i, 1, &oneChar))
+            ;  // retry on page fault
+        str[i] = (unsigned char)oneChar;
+    }
+    return str;
+}
+```
+
+#### `StringSys2User()` — retry `WriteMem` on page fault
+
+```cpp
+void StringSys2User(char* str, int addr, int convert_length = -1) {
+    int length = (convert_length == -1 ? strlen(str) : convert_length);
+    for (int i = 0; i < length; i++) {
+        while (!kernel->machine->WriteMem(addr + i, 1, str[i]))
+            ;  // retry on page fault (demand paging)
+    }
+    while (!kernel->machine->WriteMem(addr + length, 1, '\0'))
+        ;
+}
+```
+
+#### `ExceptionHandler()` — handle `PageFaultException`
+
+```cpp
+case NoException:
+    kernel->interrupt->setStatus(SystemMode);
+    DEBUG(dbgSys, "Switch to system mode\n");
+    return;  // return, not break
+
+case PageFaultException: {
+    // Get the faulting virtual address
+    unsigned int vaddr = kernel->machine->ReadRegister(BadVAddrReg);
+    unsigned int paddr;
+    // Re-invoke Translate — our updated version will load the page
+    ExceptionType result = kernel->currentThread->space->Translate(vaddr, &paddr, 0);
+    if (result != NoException) {
+        cerr << "Page fault could not be resolved at vaddr " << vaddr << "\n";
+        SysHalt();
+        ASSERTNOTREACHED();
+    }
+    // Do NOT advance PC — re-execute the faulting instruction
+    return;  // must return, not break
+}
+```
+
+Also change `break` to `return` at the end of `SyscallException`:
+
+```cpp
+        default:
+            cerr << "Unexpected system call " << type << "\n";
+            break;
+    }
+    return;  // was: break
+```
+
+---
+
+### 4. `code/threads/pcb.cc`
+
+Fixed the null-space check to also catch partially constructed `AddrSpace` objects using `isLoaded()`:
+
+```cpp
+void StartProcess_2(void* pid) {
+    int id;
+    id = *((int*)pid);
+    char* fileName = kernel->pTab->GetFileName(id);
+
+    AddrSpace* space;
+    space = new AddrSpace(fileName);
+
+    if (space == NULL || !space->isLoaded()) {  // CHANGED
+        printf("\nPCB::Exec: Can't create AddSpace for %s\n", fileName);
+        delete space;
+        return;
+    }
+    // ... rest unchanged
+}
+```
+
+---
+
+## How It Works
+
+```
+Process accesses virtual address for the first time
+  → page is invalid → CPU raises PageFaultException
+  → ExceptionHandler catches PageFaultException
+  → calls AddrSpace::Translate(vaddr, &paddr, 0)
+  → Translate finds page invalid
+  → allocates a free physical frame via gPhysPageBitMap->FindAndSet()
+  → zeros the frame
+  → reads the correct segment bytes from executableFile into the frame
+  → marks page valid, sets physicalPage
+  → returns NoException
+  → ExceptionHandler returns (does NOT advance PC)
+  → CPU re-executes the faulting instruction — now succeeds
+```
+
+---
+
+
+## Key Design Decisions
+
+| Decision | Reason |
+|----------|--------|
+| Keep `executableFile` open | Pages are read from it on every fault — cannot close in constructor |
+| `pageTable[i].valid = FALSE` at init | Ensures every first access triggers `PageFaultException` |
+| `#ifdef RDATA` for readonlyData | Build uses `-DRDATA` flag — string literals go in `readonlyData` segment, not `code` or `uninitData` |
+| Retry loops in `ReadMem`/`WriteMem` | On demand paging, first call returns `FALSE` after loading; retry reads the now-valid byte |
+| `return` not `break` in `PageFaultException` | `break` falls through to `ASSERTNOTREACHED()` — must `return` to re-execute faulting instruction |
+| `isLoaded()` check in `pcb.cc` | `new AddrSpace()` never returns NULL in C++ — must check `pageTable != NULL` instead |
