@@ -1341,3 +1341,424 @@ Process accesses virtual address for the first time
 | Retry loops in `ReadMem`/`WriteMem` | On demand paging, first call returns `FALSE` after loading; retry reads the now-valid byte |
 | `return` not `break` in `PageFaultException` | `break` falls through to `ASSERTNOTREACHED()` — must `return` to re-execute faulting instruction |
 | `isLoaded()` check in `pcb.cc` | `new AddrSpace()` never returns NULL in C++ — must check `pageTable != NULL` instead |
+
+
+# Task 6) Software-Managed TLB Implementation in NachOS
+
+## Overview
+
+Implemented a software-managed TLB in NachOS. The TLB acts as a small cache (size 4) of recent address translations. All pages are still loaded into memory when a process starts (backed by the page table). On a TLB miss, the kernel finds the correct page-table entry and loads it into the TLB. On a context switch, TLB state is saved back to the page table and the TLB is flushed to prevent stale translations leaking across processes.
+
+---
+
+## Files Modified
+
+| File | Change |
+|------|--------|
+| `code/build.linux/Makefile` | Added `-DUSE_TLB` to `DEFINES` |
+| `code/userprog/addrspace.h` | Added TLB helper method declarations |
+| `code/userprog/addrspace.cc` | Rewrote `SaveState()`, `RestoreState()`; added `FindPTE()`, `SaveTLBState()`, `ClearTLB()` |
+| `code/userprog/exception.cc` | Added TLB counters, `SelectTLBVictim()`, `SaveBackTLBEntry()`, `HandleTLBMiss()`; changed `PageFaultException` handler; added stats print |
+| `code/test/exec.c` | Changed `Exec("num_io")` to `Exec("halt")` to avoid waiting for console input |
+
+---
+
+## Implementation
+
+### 1. `code/build.linux/Makefile`
+
+Enable TLB mode:
+
+```make
+DEFINES = -DUSE_TLB -DFILESYS_STUB -DRDATA -DSIM_FIX
+```
+
+---
+
+### 2. `code/userprog/addrspace.h`
+
+Added TLB helper methods to the public section. All demand-paging private fields from Task 5 are kept unchanged.
+
+```cpp
+#ifndef ADDRSPACE_H
+#define ADDRSPACE_H
+
+#include "copyright.h"
+#include "filesys.h"
+
+#define UserStackSize 1024
+
+class AddrSpace {
+   public:
+    AddrSpace();
+    AddrSpace(char *fileName);
+    ~AddrSpace();
+
+    bool isLoaded() { return pageTable != NULL; }
+
+    void Execute();
+
+    void SaveState();
+    void RestoreState();
+
+    ExceptionType Translate(unsigned int vaddr, unsigned int *paddr, int mode);
+
+    // TLB helpers
+    int NumPages() const { return numPages; }
+    TranslationEntry *GetPageTable() { return pageTable; }
+    TranslationEntry *FindPTE(int vpn);
+    void SaveTLBState();
+    void ClearTLB();
+
+   private:
+    TranslationEntry *pageTable;
+    unsigned int numPages;
+
+    // --- DEMAND PAGING: keep executable open for lazy page loading ---
+    OpenFile *executableFile;
+    int codeOffset;
+    int codeSize;
+    int codeVirtualAddr;
+    int dataOffset;
+    int dataSize;
+    int dataVirtualAddr;
+    int uninitOffset;
+    int uninitSize;
+    int uninitVirtualAddr;
+#ifdef RDATA
+    int rdataOffset;
+    int rdataSize;
+    int rdataVirtualAddr;
+#endif
+    // -----------------------------------------------------------------
+
+    void InitRegisters();
+};
+
+#endif  // ADDRSPACE_H
+```
+
+---
+
+### 3. `code/userprog/addrspace.cc`
+
+#### `SaveState()` — save TLB bits back to page table on context switch out
+
+```cpp
+void AddrSpace::SaveState() {
+#ifdef USE_TLB
+    SaveTLBState();
+#endif
+}
+```
+
+#### `RestoreState()` — flush TLB on context switch in; do NOT install page table pointer
+
+```cpp
+void AddrSpace::RestoreState() {
+#ifdef USE_TLB
+    kernel->machine->pageTable     = NULL;
+    kernel->machine->pageTableSize = 0;
+    ClearTLB();
+#else
+    kernel->machine->pageTable     = pageTable;
+    kernel->machine->pageTableSize = numPages;
+#endif
+}
+```
+
+#### `FindPTE()` — safe page-table lookup by virtual page number
+
+```cpp
+TranslationEntry *AddrSpace::FindPTE(int vpn) {
+    if (vpn < 0 || (unsigned int)vpn >= numPages)
+        return NULL;
+    return &pageTable[vpn];
+}
+```
+
+#### `SaveTLBState()` — copy use/dirty bits from TLB back into page table
+
+```cpp
+void AddrSpace::SaveTLBState() {
+#ifdef USE_TLB
+    Machine *machine = kernel->machine;
+    for (int i = 0; i < TLBSize; i++) {
+        TranslationEntry &tlbEntry = machine->tlb[i];
+        if (!tlbEntry.valid) continue;
+        TranslationEntry *pte = FindPTE(tlbEntry.virtualPage);
+        if (pte != NULL) {
+            pte->use   = pte->use   || tlbEntry.use;
+            pte->dirty = pte->dirty || tlbEntry.dirty;
+        }
+    }
+#endif
+}
+```
+
+#### `ClearTLB()` — invalidate all TLB slots
+
+```cpp
+void AddrSpace::ClearTLB() {
+#ifdef USE_TLB
+    for (int i = 0; i < TLBSize; i++)
+        kernel->machine->tlb[i].valid = FALSE;
+#endif
+}
+```
+
+---
+
+### 4. `code/userprog/exception.cc`
+
+#### Global TLB counters and replacement state (add near top of file, after includes)
+
+```cpp
+// ---- TLB statistics ----
+static int gTLBMissCount        = 0;
+static int gTLBReplaceCount     = 0;
+static int gTLBInvalidFillCount = 0;
+static int gTLBSaveBackCount    = 0;
+
+static int nextTLBSlot = 0;
+```
+
+#### `SelectTLBVictim()` — round-robin replacement, prefer invalid slots first
+
+```cpp
+static int SelectTLBVictim() {
+    // Prefer any invalid slot first
+    for (int i = 0; i < TLBSize; i++) {
+        if (!kernel->machine->tlb[i].valid) {
+            gTLBInvalidFillCount++;
+            return i;
+        }
+    }
+    // All slots valid — evict round-robin
+    int victim = nextTLBSlot;
+    nextTLBSlot = (nextTLBSlot + 1) % TLBSize;
+    gTLBReplaceCount++;
+    return victim;
+}
+```
+
+#### `SaveBackTLBEntry()` — copy use/dirty bits from one TLB slot back to page table before eviction
+
+```cpp
+static void SaveBackTLBEntry(AddrSpace *space, TranslationEntry &entry) {
+    if (!entry.valid || space == NULL) return;
+    TranslationEntry *pte = space->FindPTE(entry.virtualPage);
+    if (pte != NULL) {
+        pte->use   = pte->use   || entry.use;
+        pte->dirty = pte->dirty || entry.dirty;
+        if (entry.dirty) gTLBSaveBackCount++;
+    }
+}
+```
+
+#### `HandleTLBMiss()` — core TLB miss handler
+
+```cpp
+static bool HandleTLBMiss() {
+#ifndef USE_TLB
+    return false;
+#else
+    AddrSpace *space = kernel->currentThread->space;
+    if (space == NULL) return false;
+
+    int badVAddr = kernel->machine->ReadRegister(BadVAddrReg);
+    int vpn = (unsigned int)badVAddr / PageSize;
+
+    // With demand paging: page may not be loaded yet — call Translate() to load it first
+    unsigned int paddr;
+    space->Translate((unsigned int)badVAddr, &paddr, 0);
+
+    // Now the page should be valid
+    TranslationEntry *pte = space->FindPTE(vpn);
+    if (pte == NULL || !pte->valid) return false;  // truly illegal address
+
+    gTLBMissCount++;
+    int victim = SelectTLBVictim();
+    SaveBackTLBEntry(space, kernel->machine->tlb[victim]);
+
+    kernel->machine->tlb[victim] = *pte;
+    kernel->machine->tlb[victim].valid = TRUE;
+    return true;
+#endif
+}
+```
+
+#### `PageFaultException` case in `ExceptionHandler()`
+
+```cpp
+case PageFaultException:
+    if (HandleTLBMiss()) {
+        return;  // do NOT advance PC — re-execute the faulting instruction
+    }
+    SysHalt();
+    ASSERTNOTREACHED();
+```
+
+#### `handle_SC_Halt()` — print TLB stats on Halt
+
+```cpp
+void handle_SC_Halt() {
+    DEBUG(dbgSys, "Shutdown, initiated by user program.\n");
+#ifdef USE_TLB
+    printf("\n---- TLB Statistics ----\n");
+    printf("TLB misses          : %d\n", gTLBMissCount);
+    printf("Invalid slot fills  : %d\n", gTLBInvalidFillCount);
+    printf("Valid slot evictions: %d\n", gTLBReplaceCount);
+    printf("Dirty savebacks     : %d\n", gTLBSaveBackCount);
+    printf("------------------------\n");
+#endif
+    SysHalt();
+    ASSERTNOTREACHED();
+}
+```
+
+
+---
+
+### 5. `code/test/exec.c`
+
+Changed child program from `num_io` (which waits for console input) to `halt` (which exits immediately):
+
+```c
+#include "syscall.h"
+
+int main() {
+    int pid;
+    pid = Exec("halt");
+    if (pid < 0) {
+        PrintString("Exec failed\n");
+    } else {
+        Join(pid);
+    }
+    Exit(0);
+}
+```
+
+> **Note:** After changing `exec.c`, copy the `halt` binary to the build directory:
+> ```bash
+> cp ../test/halt .
+> ```
+
+---
+
+## How It Works
+
+```
+CPU tries to translate virtual address
+  → no matching valid entry in TLB (size 4)
+  → hardware raises PageFaultException
+  → ExceptionHandler calls HandleTLBMiss()
+  → HandleTLBMiss() reads BadVAddrReg to get faulting virtual address
+  → calls space->Translate() to demand-load the page if not yet in memory
+  → calls space->FindPTE(vpn) to get the page-table entry
+  → calls SelectTLBVictim() to choose a TLB slot (invalid slot first, else round-robin)
+  → calls SaveBackTLBEntry() to copy use/dirty bits of evicted entry back to page table
+  → copies the page-table entry into the chosen TLB slot
+  → returns WITHOUT advancing PC
+  → CPU re-executes the same instruction — now succeeds via TLB hit
+
+On context switch OUT (SaveState):
+  → SaveTLBState() copies use/dirty bits from all valid TLB entries back to page table
+
+On context switch IN (RestoreState):
+  → sets machine->pageTable = NULL (kernel manages TLB, not hardware)
+  → ClearTLB() invalidates all 4 TLB slots — prevents stale translations from previous process
+```
+
+---
+
+## How to Build and Run
+
+```bash
+cd nachos-project-master/code/build.linux
+make clean && make depend && make
+
+# copy halt binary for exec test
+cp ../test/halt .
+
+./nachos -x ../test/halt
+./nachos -x ../test/sleep_test
+./nachos -x ../test/pipe_test
+```
+
+---
+
+## Results
+
+### halt
+```
+---- TLB Statistics ----
+TLB misses          : 3
+Invalid slot fills  : 3
+Valid slot evictions: 0
+Dirty savebacks     : 0
+------------------------
+Machine halting!
+Ticks: total 45, idle 0, system 30, user 15
+```
+
+### sleep_test
+```
+Requested ticks : 1000
+Slept for ticks : 1073
+---- TLB Statistics ----
+TLB misses          : 20
+Invalid slot fills  : 20
+Valid slot evictions: 0
+Dirty savebacks     : 0
+------------------------
+Machine halting!
+Ticks: total 7302, idle 5637, system 1580, user 85
+```
+
+
+
+### pipe_test
+```
+Running Pipe(pipe_writer, pipe_reader)...
+pipe_writer: writing numbers 3 7 12 5 20
+pipe_reader: reading and squaring each number
+3^2 = 9
+7^2 = 49
+12^2 = 144
+5^2 = 25
+20^2 = 400
+Pipe done.
+---- TLB Statistics ----
+TLB misses          : 233
+Invalid slot fills  : 111
+Valid slot evictions: 122
+Dirty savebacks     : 31
+------------------------
+Machine halting!
+Ticks: total 27760, idle 18747, system 6630, user 2383
+```
+
+---
+
+## TLB Statistics Explained
+
+| Metric | Meaning |
+|--------|---------|
+| **TLB misses** | Total times a virtual address was not found in the TLB — kernel had to load it from the page table |
+| **Invalid slot fills** | TLB misses resolved by filling an already-invalid (empty) slot — no eviction needed |
+| **Valid slot evictions** | TLB misses where a valid entry had to be evicted (round-robin) to make room |
+| **Dirty savebacks** | Times a dirty bit was copied back from an evicted TLB entry to the page table — means that page was written to while in TLB |
+
+---
+
+## Key Design Decisions
+
+| Decision | Reason |
+|----------|--------|
+| `TLBSize = 4` | Hardware constant already defined in `machine.h` — kept as-is |
+| `machine->pageTable = NULL` in `RestoreState()` | With `USE_TLB`, the machine uses only `tlb[]` for translation. Setting `pageTable` would confuse `translate.cc` which asserts exactly one is non-NULL |
+| `ClearTLB()` on every context switch | Prevents process A's translations from being used by process B — simplest correct design |
+| Invalid slot preferred over round-robin | Avoids unnecessary evictions and savebacks when empty slots exist |
+| `Translate()` called before TLB install | Handles demand paging + TLB together — page must be loaded into physical memory before it can be put in the TLB |
+| Stats printed in both `handle_SC_Halt()` and `handle_SC_Exit()` | `sort` and `matmult` call `Exit(0)`, not `Halt()` — stats would be lost otherwise |
